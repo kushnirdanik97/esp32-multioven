@@ -1,0 +1,14 @@
+# ESPHome build artifacts
+/.esphome/
+*.bin
+*.elf
+*.map
+
+# Секреты: только локально, в репозиторий не попадают
+/secrets.yaml
+
+# OS / IDE
+.DS_Store
+Thumbs.db
+.vscode/
+__pycache__/

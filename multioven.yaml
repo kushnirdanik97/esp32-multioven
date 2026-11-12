@@ -1,0 +1,307 @@
+substitutions:
+  device_name: "multioven"
+  friendly_name: "Мультипечь"
+
+esphome:
+  name: ${device_name}
+  friendly_name: ${friendly_name}
+  comment: "Управление мультипечью: ТЭН+SSR, вентилятор, NTC, дверь, таймер/программы"
+
+esp32:
+  board: esp32dev
+  framework:
+    type: arduino
+
+logger:
+  level: INFO
+
+api:
+  encryption:
+    key: !secret api_key
+
+ota:
+  platform: esphome
+  password: !secret ota_password
+
+wifi:
+  ssid: !secret wifi_ssid
+  password: !secret wifi_password
+  ap:
+    ssid: "${friendly_name} Fallback"
+    password: !secret ota_password
+
+captive_portal:
+
+# ---------------------------------------------------------------------------
+# ПИНЫ (ESP32 DevKit, избегаем strapping-пинов 0/2/5/12/15, чтобы при
+# загрузке/прошивке ТЭН не дёргался случайным уровнем на GPIO):
+#   GPIO26 - выход на SSR (ТЭН)         - output, LOW при старте
+#   GPIO27 - выход на реле вентилятора  - output, LOW при старте
+#   GPIO34 - вход ADC1_CH6, NTC делитель (ADC1 — совместим с Wi-Fi, в отличие от ADC2)
+#   GPIO32 - вход, дверной геркон/микровыключатель, internal pull-up
+#   GPIO33 - выход, пассивный буззер (PWM/LEDC тон)
+# ---------------------------------------------------------------------------
+
+# --- Безопасность: питание SSR и реле ---------------------------------------
+# ВАЖНО (аппаратный уровень, НЕ софтверный): дверной микровыключатель
+# рекомендуется завести ТАКЖЕ физически последовательно в цепь питания SSR
+# (например через нормально-замкнутый контакт двери на линии управления SSR,
+# либо доп. реле безопасности). Софтверный door-interlock ниже — это вторая
+# линия защиты, НЕ замена аппаратному размыканию: если ESP32 зависнет/упадёт
+# Wi-Fi/прошивка забагует, GPIO может застыть в любом состоянии, а дверной
+# контакт должен гарантированно снять питание с ТЭНа независимо от кода.
+
+output:
+  # Времяпропорциональное управление ТЭНом через PID (SSR = простое вкл/выкл,
+  # фазового регулирования нет, поэтому управляем скважностью по периоду)
+  - platform: slow_pwm
+    id: heater_pwm
+    pin:
+      number: GPIO26
+      inverted: false
+    period: 8s
+    # slow_pwm не поддерживает restore_mode напрямую — безопасность boot
+    # обеспечена тем, что PID/скрипт включают нагрев ТОЛЬКО по явному
+    # script.execute: start_program; по умолчанию выход неактивен.
+
+  # Выход для пассивного буззера (тон через LEDC)
+  - platform: ledc
+    id: buzzer_pwm
+    pin: GPIO33
+
+rtttl:
+  output: buzzer_pwm
+  id: buzzer
+
+switch:
+  - platform: gpio
+    id: fan_switch
+    name: "Вентилятор конвекции"
+    pin:
+      number: GPIO27
+      inverted: false
+    restore_mode: ALWAYS_OFF
+
+# --- Датчик температуры: NTC 130 кОм @ 20°C, делитель 3.3V -> R_fixed -> ADC -> NTC -> GND ---
+sensor:
+  - platform: adc
+    pin: GPIO34
+    id: oven_adc_raw
+    attenuation: 12db
+    update_interval: 2s
+    name: "ADC raw (debug)"
+    internal: true
+
+  - platform: resistance
+    id: oven_ntc_resistance
+    sensor: oven_adc_raw
+    configuration: DOWNSTREAM   # 3.3V--[R_fixed]--ADC_pin--[NTC]--GND
+    resistor: 120kOhm           # фиксированный резистор делителя (ближайший стандартный к 130к)
+    internal: true
+
+  - platform: ntc
+    id: oven_temperature
+    sensor: oven_ntc_resistance
+    name: "Температура духовки"
+    calibration:
+      b_constant: 3950          # типовое значение, ТРЕБУЕТ калибровки по факту (см. примечания)
+      reference_resistance: 130kOhm
+      reference_temperature: 20°C
+    filters:
+      - median:
+          window_size: 5
+          send_every: 5
+
+binary_sensor:
+  - platform: gpio
+    id: door_sensor
+    name: "Дверь духовки"
+    device_class: door
+    pin:
+      number: GPIO32
+      mode:
+        input: true
+        pullup: true
+      # inverted: уточнить по факту после монтажа - зависит от того,
+      # замкнут контакт при закрытой или при открытой двери (NC/NO)
+      inverted: true
+    filters:
+      - delayed_on: 50ms
+      - delayed_off: 50ms
+    on_press:          # дверь ОТКРЫТА
+      then:
+        - logger.log: "SAFETY: дверь открыта — останавливаю нагрев"
+        - climate.control:
+            id: oven_climate
+            mode: "OFF"
+        - output.turn_off: heater_pwm
+        - switch.turn_off: fan_switch
+        - script.stop: cooking_timer
+        - text_sensor.template.publish:
+            id: oven_status
+            state: "Остановлено: открыта дверь"
+    on_release:        # дверь ЗАКРЫТА — автостарта НЕТ, пользователь запускает программу вручную
+      then:
+        - logger.log: "Дверь закрыта"
+
+# --- Жёсткий софтверный предел температуры (вторая линия защиты сверх PID) ---
+  - platform: template
+    id: overtemp_alarm
+    name: "Перегрев (аварийный предел)"
+    device_class: problem
+    lambda: |-
+      return id(oven_temperature).state > 280.0;
+    on_press:
+      then:
+        - output.turn_off: heater_pwm
+        - climate.control:
+            id: oven_climate
+            mode: "OFF"
+        - rtttl.play: "alarm:d=4,o=5,b=180:c,c,c,c"
+        - text_sensor.template.publish:
+            id: oven_status
+            state: "АВАРИЯ: перегрев, нагрев отключен"
+
+climate:
+  - platform: pid
+    id: oven_climate
+    name: "Духовка (PID)"
+    sensor: oven_temperature
+    default_target_temperature: 180°C
+    heat_output: heater_pwm
+    control_parameters:
+      kp: 0.3
+      ki: 0.002
+      kd: 0.0
+      # Стартовые коэффициенты — ТРЕБУЮТ тюнинга под конкретный ТЭН/объём печи
+      # (замерить реальный разгон и перерегулирование, подправить kp/ki/kd).
+
+# --- Ручной режим: задать температуру и время вручную ---
+number:
+  - platform: template
+    id: manual_target_temp
+    name: "Ручной режим: температура (T)"
+    min_value: 50
+    max_value: 250
+    step: 5
+    initial_value: 180
+    optimistic: true
+    unit_of_measurement: "°C"
+
+  - platform: template
+    id: manual_duration_min
+    name: "Ручной режим: время (M)"
+    min_value: 1
+    max_value: 180
+    step: 1
+    initial_value: 30
+    optimistic: true
+    unit_of_measurement: "мин"
+
+# --- Программы готовки ---
+select:
+  - platform: template
+    id: cooking_program
+    name: "Программа готовки"
+    options:
+      - "Ручной режим"
+      - "Пицца (230°C, 15 мин)"
+      - "Выпечка (180°C, 40 мин)"
+      - "Разогрев (100°C, 20 мин)"
+    initial_option: "Ручной режим"
+    optimistic: true
+
+globals:
+  - id: remaining_seconds
+    type: int
+    restore_value: false
+    initial_value: "0"
+
+text_sensor:
+  - platform: template
+    id: oven_status
+    name: "Статус печи"
+
+  - platform: template
+    id: timer_remaining_text
+    name: "Осталось времени"
+    lambda: |-
+      int s = id(remaining_seconds);
+      if (s <= 0) return {"—"};
+      char buf[8];
+      snprintf(buf, sizeof(buf), "%02d:%02d", s/60, s%60);
+      return {std::string(buf)};
+    update_interval: 1s
+
+button:
+  - platform: template
+    name: "Старт"
+    id: start_button
+    on_press:
+      - script.execute: start_program
+
+  - platform: template
+    name: "Стоп"
+    id: stop_button
+    on_press:
+      - script.stop: cooking_timer
+      - climate.control:
+          id: oven_climate
+          mode: "OFF"
+      - switch.turn_off: fan_switch
+      - output.turn_off: heater_pwm
+      - text_sensor.template.publish:
+          id: oven_status
+          state: "Остановлено пользователем"
+
+script:
+  - id: start_program
+    then:
+      - if:
+          condition:
+            binary_sensor.is_on: door_sensor
+          then:
+            - text_sensor.template.publish:
+                id: oven_status
+                state: "Нельзя запустить: дверь открыта"
+          else:
+            - lambda: |-
+                std::string prog = id(cooking_program).current_option().str();
+                float target_temp = id(manual_target_temp).state;
+                int duration_min = (int) id(manual_duration_min).state;
+                if (prog == "Пицца (230°C, 15 мин)") { target_temp = 230; duration_min = 15; }
+                else if (prog == "Выпечка (180°C, 40 мин)") { target_temp = 180; duration_min = 40; }
+                else if (prog == "Разогрев (100°C, 20 мин)") { target_temp = 100; duration_min = 20; }
+                id(remaining_seconds) = duration_min * 60;
+                auto call = id(oven_climate).make_call();
+                call.set_mode("HEAT");
+                call.set_target_temperature(target_temp);
+                call.perform();
+            - switch.turn_on: fan_switch
+            - text_sensor.template.publish:
+                id: oven_status
+                state: "Готовка запущена"
+            - script.execute: cooking_timer
+
+  - id: cooking_timer
+    mode: restart
+    then:
+      - while:
+          condition:
+            lambda: 'return id(remaining_seconds) > 0;'
+          then:
+            - delay: 1s
+            - lambda: 'id(remaining_seconds) -= 1;'
+      - if:
+          condition:
+            lambda: 'return id(remaining_seconds) <= 0;'
+          then:
+            - climate.control:
+                id: oven_climate
+                mode: "OFF"
+            - output.turn_off: heater_pwm
+            - switch.turn_off: fan_switch
+            - rtttl.play: "done:d=4,o=5,b=100:c6,e6,g6"
+            - text_sensor.template.publish:
+                id: oven_status
+                state: "Готово!"
